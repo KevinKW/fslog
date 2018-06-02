@@ -37,6 +37,7 @@
 #include <linux/jiffies.h>
 #include <linux/slab.h>
 #include <linux/mempool.h>
+#include <linux/nfs_fs.h>
 #include <net/tcp.h>
 #include <net/sock.h>
 #include <asm/uaccess.h>
@@ -47,7 +48,7 @@ MODULE_DESCRIPTION("Log FS operations of given fs type.");
 MODULE_AUTHOR("Ckelviny@gmail.com");
 MODULE_VERSION("1.0");
 
-#define FSLOG_DEBUG
+//#define FSLOG_DEBUG
 
 /* Define log functions */
 #define msg(logLevel, ...) printk(__VA_ARGS__)
@@ -70,12 +71,109 @@ MODULE_VERSION("1.0");
 
 #ifdef FSLOG_DEBUG
 #define kdebug(fmt, args...) msg(7, KERN_DEBUG "FSLOG: (%lu:%s) " fmt, jiffies, __FUNCTION__, ## args)
+#else
+#define kdebug(fmt, args...)
 #endif
+
+#define LOG_LOOKUP     0x00000001
+#define LOG_CREATE     0x00000002
+#define LOG_LINK       0x00000004
+#define LOG_UNLINK     0x00000008
+#define LOG_SYMLINK    0x00000010
+#define LOG_MKDIR      0x00000020
+#define LOG_RMDIR      0x00000040
+#define LOG_RENAME     0x00000080
+#define LOG_GETATTR    0x00000100
+#define LOG_SETATTR    0x00000200
+#define LOG_OPEN       0x00000400
+#define LOG_READ       0x00000800
+#define LOG_WRITE      0x00001000
+#define LOG_CLOSE      0x00004000
+#define LOG_SEEK       0x00008000
+#define LOG_FSYNC      0x00010000
+#define LOG_FLUSH      0x00020000
+#define LOG_READDIR    0x00040000
+#define LOG_LOCK       0x00080000
+#define LOG_FLOCK      0x00100000
+#define LOG_MMAP       0x00200000
+#define LOG_READLINK   0x00400000
+#define LOG_FOLLOWLINK 0x00800000
+#define LOG_PUTLINK    0x01000000
+#define LOG_MOUNT      0x02000000
+#define LOG_UMOUNT     0x04000000
+#define log_ops_default \
+    LOG_CREATE|LOG_LINK|LOG_UNLINK|LOG_SYMLINK \
+    |LOG_MKDIR|LOG_RMDIR|LOG_RENAME|LOG_SETATTR \
+    |LOG_OPEN|LOG_WRITE|LOG_READDIR|LOG_READLINK \
+    |LOG_MOUNT|LOG_UMOUNT
+
+static const char* op2str(unsigned long op)
+{
+    switch(op) {
+        case LOG_LOOKUP:
+            return "lookup";
+        case LOG_CREATE:
+            return "create";
+        case LOG_LINK:
+            return "link";
+        case LOG_UNLINK:
+            return "unlink";
+        case LOG_SYMLINK:
+            return "symlink";
+        case LOG_MKDIR:
+            return "mkdir";
+        case LOG_RMDIR:
+            return "rmdir";
+        case LOG_RENAME:
+            return "rename";
+        case LOG_GETATTR:
+            return "getattr";
+        case LOG_SETATTR:
+            return "setattr";
+        case LOG_OPEN:
+            return "open";
+        case LOG_READ:
+            return "read";
+        case LOG_WRITE:
+            return "write";
+        case LOG_CLOSE:
+            return "close";
+        case LOG_SEEK:
+            return "seek";
+        case LOG_FSYNC:
+            return "fsync";
+        case LOG_FLUSH:
+            return "flush";
+        case LOG_READDIR:
+            return "readdir";
+        case LOG_LOCK:
+            return "lock";
+        case LOG_FLOCK:
+            return "flock";
+        case LOG_MMAP:
+            return "mmap";
+        case LOG_READLINK:
+            return "readlink";
+        case LOG_FOLLOWLINK:
+            return "followlink";
+        case LOG_PUTLINK:
+            return "putlink";
+        case LOG_MOUNT:
+            return "mount";
+        case LOG_UMOUNT:
+            return "umount";
+        default:
+            return "unknown";
+    }
+    return "unknown";
+}
 
 static char *fstype = "nfs";
 module_param(fstype, charp, S_IRUGO);
 static char *logpath = "/var/log/fslog_nfs.log";
 module_param(logpath, charp, S_IRUGO);
+static unsigned long ops = log_ops_default;
+module_param(ops, ulong, S_IRUGO);
 
 static const struct inode_operations *orig_file_iop;
 static const struct inode_operations *orig_dir_iop;
@@ -89,7 +187,7 @@ static const struct file_operations *orig_dir_fop;
 static struct file_operations log_file_fop;
 static struct file_operations log_dir_fop;
 
-static struct dentry *(*orig_mount)(struct file_system_type *, int, const char *, void *);
+static int (*orig_get_sb)(struct file_system_type *, int, const char *, void *, struct vfsmount *);
 static void (*orig_killsb)(struct super_block *);
 static void log_patch_dir_ops(struct inode *inode);
 static void log_patch_file_ops(struct inode *inode);
@@ -97,6 +195,67 @@ static void log_patch_slink_ops(struct inode *inode);
 struct file_system_type *orig_fs_type;
 
 static bool do_log = true;
+
+#define log_buflen 12288 //4096 * 3
+static char log_buffer[log_buflen];
+static char log_path[4096];
+
+// This function puts the dentry name into buf until get root or no buf available
+static char *__get_path(struct dentry *dentry, char *buf, int len)
+{
+    char *end = buf+len;
+    char *path;
+    int namelen;
+
+    end--;
+    *end = '\0';
+    len--;
+
+    if (len < 1)
+        goto toolong;
+
+    path = end - 1;
+    *path = '/';
+
+    while (1) {
+        struct dentry *parent;
+
+        if (IS_ROOT(dentry))
+            break;
+
+        parent = dentry->d_parent;
+
+        prefetch(parent);
+        namelen = dentry->d_name.len;
+        len -= namelen + 1;
+        if (len < 0)
+            goto toolong;
+        end -= namelen;
+        memcpy(end, dentry->d_name.name, namelen);
+        *--end = '/';
+        path = end;
+        dentry = parent;
+    }
+
+    return path;
+toolong:
+    //return ERR_PTR(-ENAMETOOLONG);
+    return "NAME_TOO_LONG";
+}
+
+static void gen_fix_log(unsigned long op, struct dentry *dentry, struct dentry *dentry2)
+{
+    int len;
+
+    len = snprintf(log_buffer, log_buflen, "%lu|%u|%s|",
+                   jiffies, current_fsuid(), op2str(op));
+    if (dentry) {
+        len += snprintf(log_buffer+len, log_buflen-len, "%s|", __get_path(dentry, log_path, 4096));
+    }
+    if (dentry2) {
+        len += snprintf(log_buffer+len, log_buflen-len, "%s|", __get_path(dentry2, log_path, 4096));
+    }
+}
 
 #define BUF_SIZE        (32<<10)
 #define BUF_THRESHOLD   512
@@ -261,6 +420,7 @@ static void log_issue_write(struct log_buf *buf)
         goto retry;
     }
 }
+
 static void log_put_buf(struct log_buf *buf)
 {
     if ((buf->len <= BUF_THRESHOLD) ||
@@ -275,12 +435,17 @@ static void log_put_buf(struct log_buf *buf)
     }
 }
 
-static void log_op(const char *fmt, ...)
+
+/* The function is protected by working_buf is null */
+static void log_op_internal(unsigned long op, struct dentry *dentry, struct dentry *dentry2, const char *fmt, va_list args)
 {
     struct log_buf *buf;
-    va_list args;
     char *start;
     int len;
+
+    if (!(op&ops)) {
+        return;
+    }
 
     buf = log_get_buf();
     if (IS_ERR(buf)) {
@@ -288,10 +453,13 @@ static void log_op(const char *fmt, ...)
         return;
     }
 
+    gen_fix_log(op, dentry, dentry2);
     start = buf->buf + buf->buflen - buf->len;
-    va_start(args, fmt);
-    len = vsnprintf(start, buf->len, fmt, args);
-    va_end(args);
+    len = snprintf(start, buf->len, "%s", log_buffer);
+
+    if (buf->len > len) {
+        len += vsnprintf(start+len, buf->len-len, fmt, args);
+    }
     start[len] = '\0';
 
     kdebug("%s", start);
@@ -300,6 +468,22 @@ static void log_op(const char *fmt, ...)
     }
 
     log_put_buf(buf);
+}
+
+static void log_op(unsigned long op, struct dentry *dentry, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    log_op_internal(op, dentry, NULL, fmt, args);
+    va_end(args);
+}
+
+static void log_op2(unsigned long op, struct dentry *dentry, struct dentry *dentry2, const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    log_op_internal(op, dentry, dentry2, fmt, args);
+    va_end(args);
 }
 
 static inline const struct inode_operations *get_orig_iop(struct inode *inode)
@@ -351,18 +535,17 @@ static struct dentry *log_lookup(struct inode *dir, struct dentry *dentry, struc
     d = orig_dir_iop->lookup(dir, dentry, nd);
 
     if (IS_ERR(d)) {
-        log_op("Doing lookup name \"%s\" in dir %p(ino:%lu) ret %ld\n",
-                get_dentry_name(dentry), dir, dir->i_ino, PTR_ERR(d));
+        //log_op(LOG_LOOKUP, dentry, "Doing lookup name \"%s\" in dir %p(ino:%lu) ret %ld\n", get_dentry_name(dentry), dir, dir->i_ino, PTR_ERR(d));
+        log_op(LOG_LOOKUP, dentry, "(%ld)\n", PTR_ERR(d));
         goto out;
     }
 
     if (dentry->d_inode) {
-        log_op("Doing lookup name \"%s\" in dir %p(ino:%lu) found\n",
-                get_dentry_name(dentry), dir, dir->i_ino);
+        //log_op(LOG_LOOKUP, dentry, "Doing lookup name \"%s\" in dir %p(ino:%lu) found\n", get_dentry_name(dentry), dir, dir->i_ino);
+        log_op(LOG_LOOKUP, dentry, "found (ino:%lu)\n", dentry->d_inode->i_ino);
         log_do_patch(dentry->d_inode);
     } else {
-        log_op("Doing lookup name \"%s\" in dir %p(ino:%lu) not found\n",
-                get_dentry_name(dentry), dir, dir->i_ino);
+        log_op(LOG_LOOKUP, dentry, "not found\n");
     }
 
   out:
@@ -375,8 +558,7 @@ static void *log_follow_link(struct dentry *dentry, struct nameidata *nd)
 
     p = orig_slink_iop->follow_link(dentry, nd);
 
-    log_op("Doing follow link for dentry name %s ret %p\n",
-            get_dentry_name(dentry), p);
+    log_op(LOG_FOLLOWLINK, dentry, "(%d)\n", IS_ERR(p)?PTR_ERR(p):0);
 
     return p;
 }
@@ -387,16 +569,16 @@ static int log_readlink(struct dentry *dentry, char __user *buffer, int buflen)
 
     ret = orig_slink_iop->readlink(dentry, buffer, buflen);
 
-    log_op("Doing readlink for dentry name %s ret %d\n",
-            get_dentry_name(dentry), ret);
+    //log_op(LOG_READLINK, dentry, "Doing readlink for dentry name %s|(%d)\n", get_dentry_name(dentry), ret);
+    log_op(LOG_READLINK, dentry, "%s||(%d)\n", ret?"error":buffer, ret);
 
     return ret;
 }
 
 static void log_put_link(struct dentry *dentry, struct nameidata *nd, void *cookie)
 {
-    log_op("Doing put link for dentry name %s\n",
-            get_dentry_name(dentry));
+    //log_op(LOG_PUTLINK, dentry, "Doing put link for dentry name %s\n", get_dentry_name(dentry));
+    log_op(LOG_PUTLINK, dentry, "\n");
 
     return orig_slink_iop->put_link(dentry, nd, cookie);
 }
@@ -409,10 +591,12 @@ static int log_create(struct inode *dir, struct dentry *dentry, int mode, struct
 
     if (!ret && dentry->d_inode) {
         log_do_patch(dentry->d_inode);
+        log_op(LOG_CREATE, dentry, "success (ino:%lu)\n", dentry->d_inode->i_ino);
+    } else {
+        log_op(LOG_CREATE, dentry, "(%d)\n", ret);
     }
 
-    log_op("Doing create name %s in dir %p(ino:%lu) ret %d\n",
-            get_dentry_name(dentry), dir, dir->i_ino, ret);
+    //log_op(LOG_CREATE, dentry, "Doing create name %s in dir %p(ino:%lu)|(%d)\n", get_dentry_name(dentry), dir, dir->i_ino, ret);
 
     return ret;
 }
@@ -426,7 +610,7 @@ static int log_link(struct dentry *old_dentry, struct inode *dir, struct dentry 
         log_do_patch(new_dentry->d_inode);
     }
 
-    log_op("Doing link from %s to %s in dir %p(ino:%lu) ret %d\n",
+    log_op2(LOG_LINK, old_dentry, new_dentry, "Doing link from %s to %s in dir %p(ino:%lu)|(%d)\n",
             get_dentry_name(old_dentry), get_dentry_name(new_dentry),
             dir, dir->i_ino, ret);
 
@@ -439,8 +623,8 @@ static int log_unlink(struct inode *dir, struct dentry *dentry)
 
     ret = orig_dir_iop->unlink(dir, dentry);
 
-    log_op("Doing unlink name %s in dir %p(ino:%lu) ret %d\n",
-            get_dentry_name(dentry), dir, dir->i_ino, ret);
+    //log_op(LOG_UNLINK, dentry, "Doing unlink name %s in dir %p(ino:%lu)|(%d)\n", get_dentry_name(dentry), dir, dir->i_ino, ret);
+    log_op(LOG_UNLINK, dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -451,8 +635,8 @@ static int log_symlink(struct inode *dir, struct dentry *dentry, const char *sym
 
     ret = orig_dir_iop->symlink(dir, dentry, symname);
 
-    log_op("Doing soft link from %s to %s in dir %p(ino:%lu) ret %d\n",
-            get_dentry_name(dentry), symname, dir, dir->i_ino, ret);
+    //log_op(LOG_SYMLINK, dentry, "Doing soft link from %s to %s in dir %p(ino:%lu)|(%d)\n", get_dentry_name(dentry), symname, dir, dir->i_ino, ret);
+    log_op(LOG_SYMLINK, dentry, "link to %s|(%d)\n", symname, ret);
 
     if (!ret && dentry->d_inode) {
         log_patch_slink_ops(dentry->d_inode);
@@ -467,8 +651,8 @@ static int log_mkdir(struct inode *dir, struct dentry *dentry, int mode)
 
     ret = orig_dir_iop->mkdir(dir, dentry, mode);
 
-    log_op("Doing mkdir name %s in dir %p(ino:%lu) ret %d\n",
-            get_dentry_name(dentry), dir, dir->i_ino, ret);
+    //log_op(LOG_MKDIR, dentry, "Doing mkdir name %s in dir %p(ino:%lu)|(%d)\n", get_dentry_name(dentry), dir, dir->i_ino, ret);
+    log_op(LOG_MKDIR, dentry, "(%d)\n", ret);
 
     if (!ret && dentry->d_inode) {
         log_patch_dir_ops(dentry->d_inode);
@@ -483,8 +667,8 @@ static int log_rmdir(struct inode *dir, struct dentry *dentry)
 
     ret = orig_dir_iop->rmdir(dir, dentry);
 
-    log_op("Doing rmdir name %s in dir %p(ino:%lu) ret %d\n",
-            get_dentry_name(dentry), dir, dir->i_ino, ret);
+    //log_op(LOG_RMDIR, dentry, "Doing rmdir name %s in dir %p(ino:%lu)|(%d)\n", get_dentry_name(dentry), dir, dir->i_ino, ret);
+    log_op(LOG_RMDIR, dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -496,10 +680,14 @@ static int log_rename(struct inode *old_dir, struct dentry *old_dentry,
 
     ret = orig_dir_iop->rename(old_dir, old_dentry, new_dir, new_dentry);
 
-    log_op("Doing rename from %s in dir %p(ino:%lu) to %s in dir %p(ino:%lu) ret %d\n",
+#if 0
+    log_op2(LOG_RENAME, old_dentry, new_dentry,
+            "Doing rename from %s in dir %p(ino:%lu) to %s in dir %p(ino:%lu)|(%d)\n",
             get_dentry_name(old_dentry), old_dir, old_dir->i_ino,
             get_dentry_name(new_dentry), new_dir, new_dir->i_ino,
             ret);
+#endif
+    log_op2(LOG_RENAME, old_dentry, new_dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -510,8 +698,8 @@ static int log_getattr(struct vfsmount *mnt, struct dentry *dentry, struct kstat
 
     ret = get_orig_iop(dentry->d_inode)->getattr(mnt, dentry, stat);
 
-    log_op("Doing getattr from name %s ret %d\n",
-            get_dentry_name(dentry), ret);
+    //log_op(LOG_GETATTR, dentry, "Doing getattr from name %s|(%d)\n", get_dentry_name(dentry), ret);
+    log_op(LOG_GETATTR, dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -522,8 +710,8 @@ static int log_setattr(struct dentry *dentry, struct iattr *attr)
 
     ret = get_orig_iop(dentry->d_inode)->setattr(dentry, attr);
 
-    log_op("Doing setattr to file name %s ret %d\n",
-            get_dentry_name(dentry), ret);
+    //log_op(LOG_SETATTR, dentry, "Doing setattr to file name %s|(%d)\n", get_dentry_name(dentry), ret);
+    log_op(LOG_SETATTR, dentry, "ia_valid %u|(%d)\n", attr->ia_valid, ret);
 
     return ret;
 }
@@ -534,8 +722,8 @@ static loff_t log_llseek(struct file *filp, loff_t offset, int origin)
 
     ret = get_orig_fop(filp)->llseek(filp, offset, origin);
 
-    log_op("llseek file %s to offset %llu, origion %d ret %llu\n",
-            get_dentry_name(filp->f_dentry), offset, origin, ret);
+    //log_op(LOG_SEEK, filp->f_dentry, "llseek file %s to offset %llu, origion %d ret %llu\n", get_dentry_name(filp->f_dentry), offset, origin, ret);
+    log_op(LOG_SEEK, filp->f_dentry, "offset %llu, origion %d|(%llu)\n", offset, origin, ret);
 
     return ret;
 }
@@ -546,8 +734,8 @@ static int log_readdir(struct file *filp, void *dirent, filldir_t filldir)
 
     ret = orig_dir_fop->readdir(filp, dirent, filldir);
 
-    log_op("Doing readdir for filp %p name %s ret %d\n",
-            filp, get_dentry_name(filp->f_dentry), ret);
+    //log_op(LOG_READDIR, filp->f_dentry, "Doing readdir for filp %p name %s|(%d)\n", filp, get_dentry_name(filp->f_dentry), ret);
+    log_op(LOG_READDIR, filp->f_dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -558,8 +746,8 @@ static ssize_t log_read(struct file *filp, char __user *buf, size_t count, loff_
 
     ret = get_orig_fop(filp)->read(filp, buf, count, ppos);
 
-    log_op("Read file %s buf %p, size %zd offset %llu ret %zd\n",
-            get_dentry_name(filp->f_dentry), buf, count, *ppos, ret);
+    //log_op(LOG_READ, filp->f_dentry, "Read file %s buf %p, size %zd offset %llu ret %zd\n", get_dentry_name(filp->f_dentry), buf, count, *ppos, ret);
+    log_op(LOG_READ, filp->f_dentry, "size %zd offset %llu|(%zd)\n", count, *ppos-count, ret);
 
     return ret;
 }
@@ -570,8 +758,8 @@ static ssize_t log_write(struct file *filp, const char __user *buf, size_t count
 
     ret = get_orig_fop(filp)->write(filp, buf, count, ppos);
 
-    log_op("Write file %s buf %p, size %zd offset %llu ret %zd\n",
-            get_dentry_name(filp->f_dentry), buf, count, *ppos, ret);
+    //log_op(LOG_WRITE, filp->f_dentry, "Write file %s buf %p, size %zd offset %llu ret %zd\n", get_dentry_name(filp->f_dentry), buf, count, *ppos, ret);
+    log_op(LOG_WRITE, filp->f_dentry, "size %zd offset %llu|(%zd)\n", count, *ppos-count, ret);
 
     return ret;
 }
@@ -583,9 +771,12 @@ static ssize_t log_aio_read(struct kiocb *iocb, const struct iovec *iov,
 
     ret = get_orig_fop(iocb->ki_filp)->aio_read(iocb, iov, nr_segs, pos);
 
-    log_op("AIO Read file %s iov %p, nr_segs %lu offset %llu, kiocb %p ret %zd\n",
+#if 0
+    log_op(LOG_READ, iocb->ki_filp->f_dentry, "AIO Read file %s iov %p, nr_segs %lu offset %llu, kiocb %p ret %zd\n",
             get_dentry_name(iocb->ki_filp->f_dentry),
             iov, nr_segs, pos, iocb, ret);
+#endif
+    log_op(LOG_READ, iocb->ki_filp->f_dentry, "offset %llu|(%zd)\n", pos, ret);
 
     return ret;
 }
@@ -597,9 +788,12 @@ static ssize_t log_aio_write(struct kiocb *iocb, const struct iovec *iov,
 
     ret = get_orig_fop(iocb->ki_filp)->aio_write(iocb, iov, nr_segs, pos);
 
-    log_op("AIO Write file %s iov %p, nr_segs %lu offset %llu, kiocb %p ret %zd\n",
+#if 0
+    log_op(LOG_WRITE, iocb->ki_filp->f_dentry, "AIO Write file %s iov %p, nr_segs %lu offset %llu, kiocb %p ret %zd\n",
             get_dentry_name(iocb->ki_filp->f_dentry),
             iov, nr_segs, pos, iocb, ret);
+#endif
+    log_op(LOG_WRITE, iocb->ki_filp->f_dentry, "offset %llu|(%zd)\n", pos, ret);
 
     return ret;
 }
@@ -610,8 +804,8 @@ static int log_mmap(struct file *filp, struct vm_area_struct *vma)
 
     ret = get_orig_fop(filp)->mmap(filp, vma);
 
-    log_op("Write file %s vma %p ret %d\n",
-            get_dentry_name(filp->f_dentry), vma, ret);
+    //log_op(LOG_MMAP, filp->f_dentry, "MMAP file %s vma %p|(%d)\n", get_dentry_name(filp->f_dentry), vma, ret);
+    log_op(LOG_MMAP, filp->f_dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -621,9 +815,8 @@ static int log_open(struct inode *inode, struct file *filp)
     int ret;
 
     ret = get_orig_fop(filp)->open(inode, filp);
-    log_op("Open file %s inode %p ino %lu ret %d\n",
-            get_dentry_name(filp->f_dentry),
-            inode, inode->i_ino, ret);
+    //log_op(LOG_OPEN, filp->f_dentry, "Open file %s inode %p ino %lu|(%d)\n", get_dentry_name(filp->f_dentry), inode, inode->i_ino, ret);
+    log_op(LOG_OPEN, filp->f_dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -634,9 +827,8 @@ static int log_release(struct inode *inode, struct file *filp)
 
     ret = get_orig_fop(filp)->release(inode, filp);
 
-    log_op("Release file %s inode %p ino %lu ret %d\n",
-            get_dentry_name(filp->f_dentry),
-            inode, inode->i_ino, ret);
+    //log_op(LOG_CLOSE, filp->f_dentry, "Release file %s inode %p ino %lu|(%d)\n", get_dentry_name(filp->f_dentry), inode, inode->i_ino, ret);
+    log_op(LOG_CLOSE, filp->f_dentry, "(%d)\n", ret);
     return ret;
 }
 
@@ -645,20 +837,20 @@ static int log_flush(struct file *filp, fl_owner_t id)
     int ret;
 
     ret = get_orig_fop(filp)->flush(filp, id);
-    log_op("Flush file %s owner %p ret %d\n",
-            get_dentry_name(filp->f_dentry), id, ret);
+    //log_op(LOG_FLUSH, filp->f_dentry, "Flush file %s owner %p|(%d)\n", get_dentry_name(filp->f_dentry), id, ret);
+    log_op(LOG_FLUSH, filp->f_dentry, "(%d)\n", ret);
 
     return ret;
 }
 
-static int log_fsync(struct file *filp, int datasync)
+static int log_fsync(struct file *filp, struct dentry *dentry, int datasync)
 {
     int ret;
 
-    ret = get_orig_fop(filp)->fsync(filp, datasync);
+    ret = get_orig_fop(filp)->fsync(filp, dentry, datasync);
 
-    log_op("Fsync file %s datasync %d ret %d\n",
-            get_dentry_name(filp->f_dentry), datasync, ret);
+    //log_op(LOG_FSYNC, filp->f_dentry, "Fsync file %s datasync %d|(%d)\n", get_dentry_name(filp->f_dentry), datasync, ret);
+    log_op(LOG_FSYNC, filp->f_dentry, "(%d)\n", ret);
 
     return ret;
 }
@@ -669,8 +861,8 @@ static int log_lock(struct file *filp, int cmd, struct file_lock *fl)
 
     ret = get_orig_fop(filp)->lock(filp, cmd, fl);
 
-    log_op("Trying to lock file %s cmd %d range (%llu-%llu) type %d ret %d\n",
-            get_dentry_name(filp->f_dentry), cmd, fl->fl_start, fl->fl_end, fl->fl_type, ret);
+    //log_op(LOG_LOCK, filp->f_dentry, "Trying to lock file %s cmd %d range (%llu-%llu) type %d|(%d)\n", get_dentry_name(filp->f_dentry), cmd, fl->fl_start, fl->fl_end, fl->fl_type, ret);
+    log_op(LOG_LOCK, filp->f_dentry, "range (%llu-%llu) type %d|(%d)\n", fl->fl_start, fl->fl_end, fl->fl_type, ret);
 
     return ret;
 }
@@ -681,8 +873,8 @@ static int log_flock(struct file *filp, int cmd, struct file_lock *fl)
 
     ret = get_orig_fop(filp)->flock(filp, cmd, fl);
 
-    log_op("Trying to lock file %s cmd %d range (%llu-%llu) type %d ret %d\n",
-            get_dentry_name(filp->f_dentry), cmd, fl->fl_start, fl->fl_end, fl->fl_type, ret);
+    //log_op(LOG_FLOCK, filp->f_dentry, "Trying to lock file %s cmd %d range (%llu-%llu) type %d|(%d)\n", get_dentry_name(filp->f_dentry), cmd, fl->fl_start, fl->fl_end, fl->fl_type, ret);
+    log_op(LOG_FLOCK, filp->f_dentry, "range (%llu-%llu) type %d|(%d)\n", fl->fl_start, fl->fl_end, fl->fl_type, ret);
 
     return ret;
 }
@@ -814,38 +1006,54 @@ static void log_patch_slink_ops(struct inode *inode)
     inode->i_op = &log_slink_iop;
 }
 
-static struct dentry *log_mount(struct file_system_type *type, int flags,
-        const char *dev_name, void *raw_data)
+static int log_mount(struct file_system_type *type, int flags,
+        const char *dev_name, void *raw_data, struct vfsmount *mnt)
 {
     struct dentry *dentry;
+    int ret;
 
-    log_op("Trying to do mount on %s\n", dev_name);
-
+    kdebug("Trying to do mount on %s\n", dev_name);
     if (!try_module_get(THIS_MODULE)) {
         kerr("Can't get reference of fslog\n");
-        return ERR_PTR(-EACCES);
+        return -EACCES;
     }
 
-    dentry = orig_mount(type, flags, dev_name, raw_data);
+    ret = orig_get_sb(type, flags, dev_name, raw_data, mnt);
 
-    if (IS_ERR(dentry)) {
-        kinfo("Orig mount failed %ld\n", PTR_ERR(dentry));
+    if (ret < 0) {
+        kinfo("Orig mount failed %d\n", ret);
         module_put(THIS_MODULE);
-        return dentry;
+        return ret;
     }
 
-    log_op("Mount succeed\n");
+    dentry = mnt->mnt_root;
 
     BUG_ON(!dentry->d_inode);
+    if ((strlen(fstype) == 3) && (strncmp(fstype, "nfs", 3) == 0)) {
+        // Check nfs v3 since it's possible nfs v3 mount nfs v4
+        kdebug("NFS version %d\n", NFS_PROTO(dentry->d_inode)->version);
+        if (NFS_PROTO(dentry->d_inode)->version != 3) {
+            kdebug("Ignore NFSv4 mount\n");
+            module_put(THIS_MODULE);
+            return ret;
+        }
+    }
+
+    log_op(LOG_MOUNT, mnt->mnt_mountpoint, "Mount %s\n", dev_name);
+
     log_patch_dir_ops(dentry->d_inode);
 
-    return dentry;
+    return ret;
 }
 
 static void log_killsb(struct super_block *sb)
 {
     struct log_buf *buf;
-    log_op("Try to umount sb %p\n", sb);
+    if ((strlen(fstype) == 3) && (strncmp(fstype, "nfs", 3) == 0)) {
+        log_op(LOG_UMOUNT, sb->s_root, "%s\n", NFS_SB(sb)->client->cl_server);
+    } else {
+        log_op(LOG_UMOUNT, NULL, "Try to umount sb %p\n", sb);
+    }
     orig_killsb(sb);
 
     // flush the buf to log file
@@ -866,6 +1074,8 @@ static int log_read_proc(char *buf, char **start, off_t offset,
     } else {
         len += sprintf(buf, "fslog stopped\n");
     }
+    len += sprintf(buf+len, "logpath=%s\n", logpath);
+    len += sprintf(buf+len, "log_ops=%lu\n", ops);
     *eof = 1;
     return len;
 }
@@ -873,9 +1083,9 @@ static int log_read_proc(char *buf, char **start, off_t offset,
 static int log_write_proc(struct file *file, const char *buffer,
         unsigned long count, void *data)
 {
-    char cmd[6];
+    char cmd[32];
 
-    if ((count != 5) && (count != 6)) {
+    if (count >= 32) {
         kerr("Invalid command\n");
         return -EINVAL;
     }
@@ -884,6 +1094,7 @@ static int log_write_proc(struct file *file, const char *buffer,
         kerr("Get command failed\n");
         return -EFAULT;
     }
+    cmd[count] = '\0';
 
     if ((count == 6) && (strncmp(cmd, "start", 5) == 0)) {
         kinfo("Start fslog\n");
@@ -894,6 +1105,22 @@ static int log_write_proc(struct file *file, const char *buffer,
     if ((count == 5) && (strncmp(cmd, "stop", 4) == 0)) {
         kinfo("Stop fslog\n");
         do_log = false;
+        return count;
+    }
+
+    if ((count > 4) && (strncmp(cmd, "ops=", 4) == 0)) {
+        char *p = cmd+4;
+        char *endptr;
+        unsigned long op;
+        if (p[strlen(p)-1] == '\n') {
+            p[strlen(p)-1] = '\0';
+        }
+        op = simple_strtoul(p, &endptr, 10);
+        if ((endptr - p) != strlen(p)) {
+            kerr("Invalid ops command: %s\n", cmd);
+            return -EINVAL;
+        }
+        ops = op;
         return count;
     }
 
@@ -920,9 +1147,10 @@ static int __init fslog_init(void)
         return -ENODEV;
     }
 
-    orig_mount = orig_fs_type->mount;
+    orig_get_sb = orig_fs_type->get_sb;
     orig_killsb = orig_fs_type->kill_sb;
-    orig_fs_type->mount = log_mount;
+    kinfo("get orig_get_sb = %p, orig_killsb = %p\n", orig_get_sb, orig_killsb);
+    orig_fs_type->get_sb = log_mount;
     orig_fs_type->kill_sb = log_killsb;
     kinfo("init fslog of fs %s to path %s succeed\n",
             fstype, logpath);
@@ -935,7 +1163,7 @@ static void __exit fslog_exit(void)
     // The put_filesystem is not exported
     //put_filesystem(orig_fs_type);
     module_put(orig_fs_type->owner);
-    orig_fs_type->mount = orig_mount;
+    orig_fs_type->get_sb = orig_get_sb;
     orig_fs_type->kill_sb = orig_killsb;
     remove_proc_entry("fslog", NULL);
     log_free_bufs();
